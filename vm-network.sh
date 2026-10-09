@@ -2,42 +2,65 @@
 set -euo pipefail
 
 # ============================================================
-# Ubuntu VM 网络自动配置脚本
+# Ubuntu VM Network Auto Config
 #
 # 网络规划：
-#   CLUSTER      VLAN32  10.99.32.X/24
-#   VM-INTERNAL  VLAN40  10.99.40.X/24   可选
-#   WEB-DMZ      VLAN41  10.99.41.X/24
 #
-# WEB-DMZ 为默认出口：
-#   GW  = 10.99.41.1
-#   DNS = 10.99.99.1
+#   CLUSTER
+#     VLAN32
+#     10.99.32.X/24
 #
-# 使用：
-#   sudo ./vm-network.sh 23
+#   VM-INTERNAL（可选）
+#     VLAN40
+#     10.99.40.X/24
+#     GW 10.99.40.1
+#     使用 Policy Routing 保证回程从 VLAN40 返回
 #
-# 直接应用：
-#   sudo ./vm-network.sh 23 --apply
+#   WEB-DMZ
+#     VLAN41
+#     10.99.41.X/24
+#     默认网关 10.99.41.1
 #
-# 没有 VM-INTERNAL：
-#   sudo ./vm-network.sh 23 --no-internal
+#   Global DNS
+#     10.99.99.1
 #
-# 手动指定接口：
-#   sudo ./vm-network.sh 23 \
+# 使用示例：
+#
+#   三网卡：
+#     sudo ./vm-network.sh 155 --apply
+#
+#   没有 VM-INTERNAL：
+#     sudo ./vm-network.sh 155 --no-internal --apply
+#
+#   手动指定接口：
+#     sudo ./vm-network.sh 155 \
 #       --cluster ens160 \
 #       --internal ens192 \
-#       --dmz ens224
+#       --dmz ens224 \
+#       --apply
+#
+# GitHub：
+# curl -fsSL URL | sudo bash -s -- 155 --apply
+#
 # ============================================================
 
+
+# ------------------------------------------------------------
+# 基础参数
+# ------------------------------------------------------------
+
 NETPLAN_FILE="/etc/netplan/99-vm-network.yaml"
+
 DNS_SERVER="10.99.99.1"
 SEARCH_DOMAIN="intra.duallee.com"
 
 CLUSTER_NET="10.99.32"
-INTERNAL_NET="10.99.40"
-DMZ_NET="10.99.41"
 
+INTERNAL_NET="10.99.40"
 INTERNAL_GW="10.99.40.1"
+INTERNAL_ROUTE_TABLE="140"
+
+DMZ_NET="10.99.41"
 DMZ_GW="10.99.41.1"
 
 APPLY=0
@@ -47,282 +70,450 @@ CLUSTER_IF=""
 INTERNAL_IF=""
 DMZ_IF=""
 
+HOST_ID=""
+
+
+# ------------------------------------------------------------
+# 函数
+# ------------------------------------------------------------
+
 usage() {
     cat <<EOF
+
 Usage:
-  $0 <last_octet> [options]
 
-Examples:
-  $0 23
-  $0 23 --apply
-  $0 23 --no-internal
-  $0 23 --cluster ens160 --internal ens192 --dmz ens224
+  $0 <IP最后一段> [参数]
 
-Options:
+
+示例：
+
+  $0 155
+
+  $0 155 --apply
+
+  $0 155 --no-internal --apply
+
+  $0 155 \
+      --cluster ens160 \
+      --internal ens192 \
+      --dmz ens224 \
+      --apply
+
+
+参数：
+
   --cluster IFACE
+      指定 CLUSTER / VLAN32 网卡
+
   --internal IFACE
+      指定 VM-INTERNAL / VLAN40 网卡
+
   --dmz IFACE
+      指定 WEB-DMZ / VLAN41 网卡
+
   --no-internal
+      当前 VM 不使用 VM-INTERNAL
+
   --apply
+      配置完成后立即执行 netplan apply
+
+  -h / --help
+      显示帮助
+
 EOF
+
     exit 1
 }
 
-[[ $# -ge 1 ]] || usage
 
-HOST_ID="$1"
-shift
-
-# -------------------------
-# 检查主机号
-# -------------------------
-if ! [[ "$HOST_ID" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: 最后一位必须是数字"
+die() {
+    echo
+    echo "ERROR: $*" >&2
+    echo
     exit 1
+}
+
+
+check_iface() {
+
+    local iface="$1"
+
+    [[ -z "$iface" ]] && return 0
+
+    if [[ ! -e "/sys/class/net/${iface}" ]]; then
+        die "找不到网卡：${iface}"
+    fi
+}
+
+
+# ------------------------------------------------------------
+# Root 检查
+# ------------------------------------------------------------
+
+if [[ "${EUID}" -ne 0 ]]; then
+    die "请使用 sudo 或 root 执行"
 fi
 
-if (( HOST_ID < 2 || HOST_ID > 254 )); then
-    echo "ERROR: 地址数字建议使用 2-254"
-    exit 1
+
+# ------------------------------------------------------------
+# 参数
+# ------------------------------------------------------------
+
+if [[ $# -gt 0 && ! "$1" =~ ^-- ]]; then
+    HOST_ID="$1"
+    shift
 fi
 
-# -------------------------
-# 参数处理
-# -------------------------
+
 while [[ $# -gt 0 ]]; do
+
     case "$1" in
+
         --cluster)
+            [[ $# -ge 2 ]] || die "--cluster 后需要接口名"
             CLUSTER_IF="$2"
             shift 2
             ;;
+
         --internal)
+            [[ $# -ge 2 ]] || die "--internal 后需要接口名"
             INTERNAL_IF="$2"
             shift 2
             ;;
+
         --dmz)
+            [[ $# -ge 2 ]] || die "--dmz 后需要接口名"
             DMZ_IF="$2"
             shift 2
             ;;
+
         --no-internal)
             NO_INTERNAL=1
             shift
             ;;
+
         --apply)
             APPLY=1
             shift
             ;;
-        *)
-            echo "Unknown option: $1"
+
+        -h|--help)
             usage
             ;;
+
+        *)
+            die "未知参数：$1"
+            ;;
+
     esac
+
 done
 
-# -------------------------
-# 必须 root
-# -------------------------
-if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: 请使用 sudo/root 运行"
-    exit 1
+
+# ------------------------------------------------------------
+# 没传 Host ID 时询问
+# ------------------------------------------------------------
+
+if [[ -z "$HOST_ID" ]]; then
+
+    if [[ -e /dev/tty ]]; then
+        read -rp "请输入服务器 IP 最后一段数字: " HOST_ID </dev/tty
+    else
+        die "没有指定 IP 最后一段"
+    fi
+
 fi
 
-command -v netplan >/dev/null || {
-    echo "ERROR: 系统没有安装 netplan"
-    exit 1
-}
 
-# -------------------------
-# 获取 VM 的物理/虚拟网卡
-# 排除 lo/docker/veth/br/wg/tun 等
-# -------------------------
+# ------------------------------------------------------------
+# Host ID 检查
+# ------------------------------------------------------------
+
+if ! [[ "$HOST_ID" =~ ^[0-9]+$ ]]; then
+    die "IP 最后一段必须是数字"
+fi
+
+if (( HOST_ID < 2 || HOST_ID > 254 )); then
+    die "IP 最后一段必须在 2-254 之间"
+fi
+
+
+# ------------------------------------------------------------
+# 检查必要程序
+# ------------------------------------------------------------
+
+command -v netplan >/dev/null 2>&1 || \
+    die "系统未安装 netplan"
+
+command -v ip >/dev/null 2>&1 || \
+    die "系统缺少 iproute2"
+
+
+# ------------------------------------------------------------
+# 自动识别网卡
+# ------------------------------------------------------------
+
 mapfile -t NICS < <(
+
     for dev in /sys/class/net/*; do
+
         nic="$(basename "$dev")"
 
-        [[ "$nic" == "lo" ]] && continue
-        [[ "$nic" =~ ^docker ]] && continue
-        [[ "$nic" =~ ^veth ]] && continue
-        [[ "$nic" =~ ^br- ]] && continue
-        [[ "$nic" =~ ^virbr ]] && continue
-        [[ "$nic" =~ ^wg ]] && continue
-        [[ "$nic" =~ ^tun ]] && continue
-        [[ "$nic" =~ ^tap ]] && continue
+        case "$nic" in
+            lo|docker*|veth*|br-*|virbr*|wg*|tun*|tap*|utun*)
+                continue
+                ;;
+        esac
 
-        # VMware / virtio 等正常网卡通常存在 device
-        [[ -e "$dev/device" ]] || continue
+        # VMware / VirtIO / 实体 NIC 一般存在 device
+        [[ -e "${dev}/device" ]] || continue
 
         echo "$nic"
+
     done | sort -V
+
 )
 
+
+NIC_COUNT="${#NICS[@]}"
+
+
 echo
-echo "检测到网卡："
+echo "============================================================"
+echo " 检测到的网卡"
+echo "============================================================"
+echo
+
+
+if (( NIC_COUNT == 0 )); then
+    die "没有检测到可用网卡"
+fi
+
+
 for nic in "${NICS[@]}"; do
-    MAC="$(cat "/sys/class/net/$nic/address" 2>/dev/null || true)"
-    CARRIER="$(cat "/sys/class/net/$nic/carrier" 2>/dev/null || echo 0)"
 
-    echo "  $nic   MAC=$MAC   carrier=$CARRIER"
+    MAC="$(cat "/sys/class/net/${nic}/address" 2>/dev/null || echo unknown)"
+    CARRIER="$(cat "/sys/class/net/${nic}/carrier" 2>/dev/null || echo 0)"
+
+    printf "  %-12s MAC=%-18s LINK=%s\n" \
+        "$nic" "$MAC" "$CARRIER"
+
 done
+
+
 echo
 
-# -------------------------
-# 自动映射
+
+# ------------------------------------------------------------
+# 自动分配网卡角色
 #
-# 2 NIC:
-#   #1 CLUSTER
-#   #2 WEB-DMZ
+# 3张：
+#   第一张 -> VLAN32
+#   第二张 -> VLAN40
+#   第三张 -> VLAN41
 #
-# 3 NIC:
-#   #1 CLUSTER
-#   #2 VM-INTERNAL
-#   #3 WEB-DMZ
-#
-# 前提：ESXi Network Adapter 顺序保持一致
-# -------------------------
+# 2张：
+#   第一张 -> VLAN32
+#   第二张 -> VLAN41
+# ------------------------------------------------------------
 
-if [[ -z "$CLUSTER_IF" || -z "$DMZ_IF" ]]; then
 
-    NIC_COUNT="${#NICS[@]}"
+if [[ -z "$CLUSTER_IF" ]]; then
+    CLUSTER_IF="${NICS[0]}"
+fi
 
-    if [[ "$NIC_COUNT" -eq 2 ]]; then
 
-        [[ -z "$CLUSTER_IF" ]] && CLUSTER_IF="${NICS[0]}"
-        [[ -z "$DMZ_IF" ]] && DMZ_IF="${NICS[1]}"
+if (( NO_INTERNAL == 1 )); then
 
-        NO_INTERNAL=1
+    INTERNAL_IF=""
 
-    elif [[ "$NIC_COUNT" -eq 3 ]]; then
+    if [[ -z "$DMZ_IF" ]]; then
 
-        [[ -z "$CLUSTER_IF" ]] && CLUSTER_IF="${NICS[0]}"
-        [[ -z "$DMZ_IF" ]] && DMZ_IF="${NICS[2]}"
+        if (( NIC_COUNT < 2 )); then
+            die "至少需要两张网卡"
+        fi
 
-        if [[ "$NO_INTERNAL" -eq 0 && -z "$INTERNAL_IF" ]]; then
+        DMZ_IF="${NICS[$((NIC_COUNT - 1))]}"
+
+    fi
+
+else
+
+    if (( NIC_COUNT >= 3 )); then
+
+        if [[ -z "$INTERNAL_IF" ]]; then
             INTERNAL_IF="${NICS[1]}"
         fi
 
+        if [[ -z "$DMZ_IF" ]]; then
+            DMZ_IF="${NICS[$((NIC_COUNT - 1))]}"
+        fi
+
+    elif (( NIC_COUNT == 2 )); then
+
+        echo "INFO: 只检测到两张网卡，自动关闭 VM-INTERNAL"
+
+        INTERNAL_IF=""
+        NO_INTERNAL=1
+
+        if [[ -z "$DMZ_IF" ]]; then
+            DMZ_IF="${NICS[1]}"
+        fi
+
     else
-        echo "ERROR: 检测到 $NIC_COUNT 张网卡，无法安全自动判断角色。"
-        echo
-        echo "请手动指定，例如："
-        echo "$0 $HOST_ID --cluster ens160 --internal ens192 --dmz ens224"
-        exit 1
+        die "只有一张网卡，无法配置 CLUSTER + WEB-DMZ"
     fi
+
 fi
 
-if [[ "$NO_INTERNAL" -eq 1 ]]; then
-    INTERNAL_IF=""
-fi
 
-# -------------------------
-# 确认接口存在
-# -------------------------
-check_iface() {
-    local iface="$1"
-
-    [[ -z "$iface" ]] && return
-
-    if [[ ! -e "/sys/class/net/$iface" ]]; then
-        echo "ERROR: 网卡不存在: $iface"
-        exit 1
-    fi
-}
+# ------------------------------------------------------------
+# 接口检查
+# ------------------------------------------------------------
 
 check_iface "$CLUSTER_IF"
 check_iface "$INTERNAL_IF"
 check_iface "$DMZ_IF"
 
-# 防止角色重复
+
 if [[ "$CLUSTER_IF" == "$DMZ_IF" ]]; then
-    echo "ERROR: CLUSTER 和 WEB-DMZ 不能是同一接口"
-    exit 1
+    die "CLUSTER 和 WEB-DMZ 不能使用同一张网卡"
 fi
+
 
 if [[ -n "$INTERNAL_IF" ]]; then
-    if [[ "$INTERNAL_IF" == "$CLUSTER_IF" ||
-          "$INTERNAL_IF" == "$DMZ_IF" ]]; then
-        echo "ERROR: VM-INTERNAL 与其他网卡重复"
-        exit 1
+
+    if [[ "$INTERNAL_IF" == "$CLUSTER_IF" ]]; then
+        die "VM-INTERNAL 和 CLUSTER 接口重复"
     fi
+
+    if [[ "$INTERNAL_IF" == "$DMZ_IF" ]]; then
+        die "VM-INTERNAL 和 WEB-DMZ 接口重复"
+    fi
+
 fi
 
-# -------------------------
+
+# ------------------------------------------------------------
 # IP
-# -------------------------
+# ------------------------------------------------------------
 
 CLUSTER_IP="${CLUSTER_NET}.${HOST_ID}"
 INTERNAL_IP="${INTERNAL_NET}.${HOST_ID}"
 DMZ_IP="${DMZ_NET}.${HOST_ID}"
 
-echo "============================================"
-echo " 网络配置"
-echo "============================================"
+
 echo
-echo "Host ID:"
-echo "  ${HOST_ID}"
+echo "============================================================"
+echo " 即将配置"
+echo "============================================================"
+
 echo
-echo "CLUSTER:"
-echo "  IF  = ${CLUSTER_IF}"
-echo "  IP  = ${CLUSTER_IP}/24"
+echo "服务器编号：${HOST_ID}"
 echo
+
+echo "CLUSTER / VLAN32"
+echo "  Interface : ${CLUSTER_IF}"
+echo "  Address   : ${CLUSTER_IP}/24"
+echo
+
+
 if [[ -n "$INTERNAL_IF" ]]; then
-    echo "VM-INTERNAL:"
-    echo "  IF  = ${INTERNAL_IF}"
-    echo "  IP  = ${INTERNAL_IP}/24"
-    echo "  GW  = ${INTERNAL_GW} (policy routing)"
+
+    echo "VM-INTERNAL / VLAN40"
+    echo "  Interface : ${INTERNAL_IF}"
+    echo "  Address   : ${INTERNAL_IP}/24"
+    echo "  Gateway   : ${INTERNAL_GW}（Policy Routing）"
     echo
+
 else
-    echo "VM-INTERNAL:"
-    echo "  未配置"
+
+    echo "VM-INTERNAL / VLAN40"
+    echo "  未启用"
     echo
+
 fi
-echo "WEB-DMZ:"
-echo "  IF  = ${DMZ_IF}"
-echo "  IP  = ${DMZ_IP}/24"
-echo "  GW  = ${DMZ_GW}"
+
+
+echo "WEB-DMZ / VLAN41"
+echo "  Interface : ${DMZ_IF}"
+echo "  Address   : ${DMZ_IP}/24"
+echo "  Gateway   : ${DMZ_GW}"
 echo
-echo "DNS:"
+
+echo "Global DNS"
 echo "  ${DNS_SERVER}"
 echo
 
-# -------------------------
+
+# ------------------------------------------------------------
 # 备份现有 Netplan
-# -------------------------
+# ------------------------------------------------------------
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
+
 BACKUP_DIR="/etc/netplan/backup-${STAMP}"
 
 mkdir -p "$BACKUP_DIR"
 
+
 shopt -s nullglob
 
-for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
-    [[ "$f" == "$NETPLAN_FILE" ]] && continue
-    cp -a "$f" "$BACKUP_DIR/"
-done
+OLD_NETPLAN_FILES=(
+    /etc/netplan/*.yaml
+    /etc/netplan/*.yml
+)
 
-echo "Netplan backup:"
-echo "  ${BACKUP_DIR}"
 
-# -------------------------
-# 如果使用 cloud-init
-# 防止它重写网络
-# -------------------------
+if (( ${#OLD_NETPLAN_FILES[@]} > 0 )); then
 
-if [[ -d /etc/cloud/cloud.cfg.d ]]; then
-    cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg <<EOF
-network:
-  config: disabled
-EOF
+    echo "备份旧 Netplan 到："
+    echo "  ${BACKUP_DIR}"
+
+    for f in "${OLD_NETPLAN_FILES[@]}"; do
+
+        echo "  备份 $(basename "$f")"
+
+        cp -a "$f" "$BACKUP_DIR/"
+
+    done
+
 fi
 
-# -------------------------
+
+# ------------------------------------------------------------
+# 删除旧活动 Netplan
+#
+# 避免 50-cloud-init.yaml 和新配置同时加载
+# ------------------------------------------------------------
+
+rm -f /etc/netplan/*.yaml
+rm -f /etc/netplan/*.yml
+
+
+# ------------------------------------------------------------
+# Cloud-init 禁止重新生成网络
+# ------------------------------------------------------------
+
+mkdir -p /etc/cloud/cloud.cfg.d
+
+cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg <<'EOF'
+network: {config: disabled}
+EOF
+
+
+# ------------------------------------------------------------
 # 生成 Netplan
-# -------------------------
+# ------------------------------------------------------------
 
 cat > "$NETPLAN_FILE" <<EOF
 # ============================================================
 # Generated by vm-network.sh
-# Host ID: ${HOST_ID}
+#
+# Host ID:
+#   ${HOST_ID}
+#
+# DO NOT edit cloud-init network file.
 # ============================================================
 
 network:
@@ -340,7 +531,18 @@ network:
 
 EOF
 
-# VM-INTERNAL 可选
+
+# ------------------------------------------------------------
+# VLAN40
+#
+# 用 Source Policy Routing：
+#
+# 如果外部 VLAN 访问 10.99.40.X，
+# 回复仍然通过 10.99.40.1 / VLAN40 返回。
+#
+# 否则多网卡主机可能从 VLAN41 默认路由回包。
+# ------------------------------------------------------------
+
 if [[ -n "$INTERNAL_IF" ]]; then
 
 cat >> "$NETPLAN_FILE" <<EOF
@@ -352,25 +554,33 @@ cat >> "$NETPLAN_FILE" <<EOF
         - ${INTERNAL_IP}/24
 
       routes:
+
         - to: ${INTERNAL_NET}.0/24
           scope: link
-          table: 40
+          table: ${INTERNAL_ROUTE_TABLE}
 
-        - to: default
+        - to: 0.0.0.0/0
           via: ${INTERNAL_GW}
-          table: 40
+          table: ${INTERNAL_ROUTE_TABLE}
           on-link: true
 
       routing-policy:
+
         - from: ${INTERNAL_IP}/32
-          table: 40
-          priority: 100
+          table: ${INTERNAL_ROUTE_TABLE}
+          priority: 1040
 
 EOF
 
 fi
 
-# WEB-DMZ
+
+# ------------------------------------------------------------
+# VLAN41
+#
+# 唯一主默认网关
+# ------------------------------------------------------------
+
 cat >> "$NETPLAN_FILE" <<EOF
     ${DMZ_IF}:
       dhcp4: false
@@ -380,95 +590,296 @@ cat >> "$NETPLAN_FILE" <<EOF
         - ${DMZ_IP}/24
 
       routes:
-        - to: default
+
+        - to: 0.0.0.0/0
           via: ${DMZ_GW}
           metric: 100
-
-      nameservers:
-        addresses:
-          - ${DNS_SERVER}
-        search:
-          - ${SEARCH_DOMAIN}
 EOF
+
 
 chmod 600 "$NETPLAN_FILE"
 
-# -------------------------
-# 多网卡服务器建议 loose rp_filter
-# -------------------------
 
-cat > /etc/sysctl.d/90-multihome-network.conf <<EOF
+# ------------------------------------------------------------
+# Netplan 语法检查
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo " Netplan 配置"
+echo "============================================================"
+echo
+
+cat "$NETPLAN_FILE"
+
+echo
+echo "正在执行 netplan generate ..."
+
+
+if ! netplan generate; then
+
+    echo
+    echo "ERROR: Netplan 配置检查失败"
+    echo "正在恢复原配置..."
+
+    rm -f /etc/netplan/*.yaml
+    rm -f /etc/netplan/*.yml
+
+    cp -a "${BACKUP_DIR}/." /etc/netplan/ 2>/dev/null || true
+
+    netplan generate 2>/dev/null || true
+
+    die "已恢复旧 Netplan"
+
+fi
+
+
+echo "Netplan 语法检查通过。"
+
+
+# ------------------------------------------------------------
+# 多网卡 rp_filter
+#
+# loose mode：
+#
+# 0 = 禁用
+# 1 = strict
+# 2 = loose
+#
+# 多网卡环境推荐 2
+# ------------------------------------------------------------
+
+cat > /etc/sysctl.d/90-multihome-network.conf <<'EOF'
 net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
 EOF
 
+
 sysctl --system >/dev/null
 
-# -------------------------
-# 验证语法
-# -------------------------
 
-echo
-echo "生成配置："
-echo "--------------------------------------------"
-cat "$NETPLAN_FILE"
-echo "--------------------------------------------"
-echo
+# ------------------------------------------------------------
+# Global DNS
+#
+# 持久化：
+#
+#   /etc/systemd/resolved.conf.d/
+#
+# 重启后依然存在。
+# ------------------------------------------------------------
 
-echo "执行 Netplan 语法检查..."
+if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved.service'; then
 
-netplan generate
+    mkdir -p /etc/systemd/resolved.conf.d
 
-echo "Netplan 配置检查通过。"
+    cat > /etc/systemd/resolved.conf.d/10-global-dns.conf <<EOF
+[Resolve]
 
-# -------------------------
-# 应用
-# -------------------------
+DNS=${DNS_SERVER}
 
-if [[ "$APPLY" -eq 1 ]]; then
+FallbackDNS=
 
-    echo
-    echo "正在应用网络配置..."
-    netplan apply
+Domains=~. ${SEARCH_DOMAIN}
 
-    sleep 2
+LLMNR=no
+MulticastDNS=no
+EOF
 
-    echo
-    echo "============================================"
-    echo " 当前地址"
-    echo "============================================"
 
-    ip -br addr
+    # Ubuntu 标准 systemd-resolved Stub
+    ln -sf \
+        /run/systemd/resolve/stub-resolv.conf \
+        /etc/resolv.conf
 
-    echo
-    echo "============================================"
-    echo " 主路由表"
-    echo "============================================"
 
-    ip route
+    systemctl enable systemd-resolved >/dev/null 2>&1 || true
 
-    if [[ -n "$INTERNAL_IF" ]]; then
-        echo
-        echo "============================================"
-        echo " VM-INTERNAL Policy Routing"
-        echo "============================================"
-
-        ip rule
-        ip route show table 40
-    fi
+    systemctl restart systemd-resolved
 
 else
 
     echo
-    echo "配置尚未正式应用。"
+    echo "WARNING:"
+    echo "  未检测到 systemd-resolved"
+    echo "  Global DNS 未自动配置"
+
+fi
+
+
+# ------------------------------------------------------------
+# 应用
+# ------------------------------------------------------------
+
+if (( APPLY == 1 )); then
+
     echo
-    echo "建议执行："
+    echo "============================================================"
+    echo " 正在应用 Netplan"
+    echo "============================================================"
     echo
-    echo "  netplan try"
+
+    netplan apply
+
+    sleep 3
+
+
     echo
-    echo "确认网络正常后再保存。"
+    echo "============================================================"
+    echo " IP 地址"
+    echo "============================================================"
     echo
-    echo "或者直接："
+
+    ip -br addr
+
+
+    echo
+    echo "============================================================"
+    echo " 主路由表"
+    echo "============================================================"
+    echo
+
+    ip route
+
+
+    echo
+    echo "============================================================"
+    echo " Policy Rules"
+    echo "============================================================"
+    echo
+
+    ip rule
+
+
+    if [[ -n "$INTERNAL_IF" ]]; then
+
+        echo
+        echo "============================================================"
+        echo " VLAN40 Policy Route Table ${INTERNAL_ROUTE_TABLE}"
+        echo "============================================================"
+        echo
+
+        ip route show table "$INTERNAL_ROUTE_TABLE"
+
+    fi
+
+
+    echo
+    echo "============================================================"
+    echo " Global DNS"
+    echo "============================================================"
+    echo
+
+    if command -v resolvectl >/dev/null 2>&1; then
+
+        resolvectl status | sed -n '1,30p'
+
+    else
+
+        cat /etc/resolv.conf
+
+    fi
+
+
+    echo
+    echo "============================================================"
+    echo " 网络测试"
+    echo "============================================================"
+    echo
+
+
+    echo "[1] WEB-DMZ Gateway"
+    if ping -c 1 -W 2 "$DMZ_GW" >/dev/null 2>&1; then
+        echo "  OK   ${DMZ_GW}"
+    else
+        echo "  FAIL ${DMZ_GW}"
+    fi
+
+
+    echo
+    echo "[2] DNS Server"
+    if ping -c 1 -W 2 "$DNS_SERVER" >/dev/null 2>&1; then
+        echo "  OK   ${DNS_SERVER}"
+    else
+        echo "  FAIL ${DNS_SERVER}"
+    fi
+
+
+    echo
+    echo "[3] DNS Resolve"
+
+    if getent hosts www.baidu.com >/dev/null 2>&1; then
+
+        echo "  OK   DNS解析正常"
+
+        getent hosts www.baidu.com | head -3
+
+    else
+
+        echo "  FAIL DNS解析失败"
+        echo
+        echo "  请确认 iStoreOS dnsmasq 已监听："
+        echo "    vlan20"
+        echo "    vlan40"
+        echo "    vlan41"
+
+    fi
+
+
+    echo
+    echo "============================================================"
+    echo " 配置完成"
+    echo "============================================================"
+    echo
+
+    echo "CLUSTER:"
+    echo "  ${CLUSTER_IF} = ${CLUSTER_IP}/24"
+
+    if [[ -n "$INTERNAL_IF" ]]; then
+
+        echo
+        echo "VM-INTERNAL:"
+        echo "  ${INTERNAL_IF} = ${INTERNAL_IP}/24"
+
+    fi
+
+    echo
+    echo "WEB-DMZ:"
+    echo "  ${DMZ_IF} = ${DMZ_IP}/24"
+    echo "  Default GW = ${DMZ_GW}"
+
+    echo
+    echo "DNS:"
+    echo "  ${DNS_SERVER}"
+
+    echo
+    echo "Netplan:"
+    echo "  ${NETPLAN_FILE}"
+
+    echo
+    echo "Backup:"
+    echo "  ${BACKUP_DIR}"
+
+    echo
+
+else
+
+    echo
+    echo "============================================================"
+    echo " 配置已生成，但尚未 Apply"
+    echo "============================================================"
+    echo
+
+    echo "建议先检查："
+    echo
+    echo "  cat ${NETPLAN_FILE}"
+    echo
+    echo "然后执行："
+    echo
+    echo "  sudo netplan try"
+    echo
+    echo "或者直接重新运行："
     echo
     echo "  $0 ${HOST_ID} --apply"
+    echo
+
 fi
